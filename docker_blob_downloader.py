@@ -56,6 +56,17 @@ class RegistryError(Exception):
     """Raised for expected registry, archive, and validation failures."""
 
 
+class BlobSizeMismatchError(RegistryError):
+    def __init__(self, path, expected_size, actual_size):
+        self.path = path
+        self.expected_size = expected_size
+        self.actual_size = actual_size
+        super(BlobSizeMismatchError, self).__init__(
+            "size mismatch for %s: expected %s bytes, got %s bytes"
+            % (path, expected_size, actual_size)
+        )
+
+
 class ImageReference(object):
     def __init__(self, registry, repository, reference, original, is_digest):
         self.registry = registry
@@ -197,10 +208,7 @@ def verify_digest(path, digest, expected_size=None):
             hasher.update(chunk)
 
     if expected_size is not None and size != expected_size:
-        raise RegistryError(
-            "size mismatch for %s: expected %s bytes, got %s bytes"
-            % (path, expected_size, size)
-        )
+        raise BlobSizeMismatchError(path, expected_size, size)
     actual = hasher.hexdigest()
     if actual != expected_hex:
         raise RegistryError(
@@ -512,32 +520,47 @@ class RegistryClient(object):
             tmp_path = Path(str(dest_path) + ".part")
 
         if dest_path.exists():
-            verify_digest(dest_path, digest, expected_size)
-            if progress is not None:
-                progress.update(expected_size if expected_size is not None else dest_path.stat().st_size)
-            return dest_path
+            try:
+                verify_digest(dest_path, digest, expected_size)
+                if progress is not None:
+                    progress.update(expected_size if expected_size is not None else dest_path.stat().st_size)
+                return dest_path
+            except RegistryError:
+                dest_path.unlink()
 
         last_error = None
-        for attempt in range(1, self.retries + 1):
-            if attempt > 1 and progress is not None:
+        consecutive_failures = 0
+        last_partial_size = tmp_path.stat().st_size if tmp_path.exists() else 0
+        while consecutive_failures < self.retries:
+            if last_error is not None and progress is not None:
                 progress.reset_current()
             try:
                 return self.download_blob_once(descriptor, dest_path, tmp_path, progress)
             except RegistryError as exc:
                 last_error = exc
-                if is_validation_error(exc):
+                current_partial_size = tmp_path.stat().st_size if tmp_path.exists() else 0
+                if current_partial_size > last_partial_size:
+                    last_partial_size = current_partial_size
+                    consecutive_failures = 0
+                elif isinstance(exc, BlobSizeMismatchError) and exc.actual_size < exc.expected_size:
+                    consecutive_failures += 1
+                elif is_validation_error(exc):
                     if tmp_path.exists():
                         tmp_path.unlink()
                     if dest_path.exists():
                         dest_path.unlink()
-                if attempt == self.retries:
-                    raise RegistryError(
-                        "failed to download blob %s after %s attempts: %s"
-                        % (digest, self.retries, exc)
-                    )
-                time.sleep(min(2 ** (attempt - 1), 8))
+                    last_partial_size = 0
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures += 1
+                if consecutive_failures >= self.retries:
+                    break
+                time.sleep(min(2 ** max(consecutive_failures - 1, 0), 8))
 
-        raise RegistryError("failed to download blob %s: %s" % (digest, last_error))
+        raise RegistryError(
+            "failed to download blob %s after %s consecutive failed attempts: %s"
+            % (digest, self.retries, last_error)
+        )
 
     def download_blob_once(self, descriptor, dest_path, tmp_path, progress=None):
         digest = descriptor.get("digest")

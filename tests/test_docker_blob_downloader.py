@@ -186,6 +186,51 @@ class DownloadBlobTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), full_data)
             self.assertEqual(opener.requests[0].get_header("Range"), "bytes=7-")
 
+    def test_download_blob_keeps_short_read_partial_and_resumes_retry(self):
+        full_data = b"short-read-then-range-rest"
+        partial = full_data[:10]
+        rest = full_data[10:]
+        digest = sha256_digest(full_data)
+        opener = FakeOpener([FakeResponse(partial), FakeResponse(rest, code=206)])
+        client = dbd.RegistryClient("example.test", "repo/image", opener, retries=2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = client.download_blob(
+                {"digest": digest, "size": len(full_data)},
+                Path(tmp) / "work",
+                cache_dir=Path(tmp) / "cache",
+            )
+
+            self.assertEqual(path.read_bytes(), full_data)
+            self.assertIsNone(opener.requests[0].get_header("Range"))
+            self.assertEqual(opener.requests[1].get_header("Range"), "bytes=10-")
+
+    def test_download_blob_does_not_spend_retry_when_short_read_grows_partial(self):
+        full_data = b"short-read-keeps-growing-until-complete"
+        first = full_data[:10]
+        second = full_data[10:20]
+        third = full_data[20:]
+        digest = sha256_digest(full_data)
+        opener = FakeOpener(
+            [
+                FakeResponse(first),
+                FakeResponse(second, code=206),
+                FakeResponse(third, code=206),
+            ]
+        )
+        client = dbd.RegistryClient("example.test", "repo/image", opener, retries=2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = client.download_blob(
+                {"digest": digest, "size": len(full_data)},
+                Path(tmp) / "work",
+                cache_dir=Path(tmp) / "cache",
+            )
+
+            self.assertEqual(path.read_bytes(), full_data)
+            self.assertEqual(opener.requests[1].get_header("Range"), "bytes=10-")
+            self.assertEqual(opener.requests[2].get_header("Range"), "bytes=20-")
+
 
 class ProgressReporterTests(unittest.TestCase):
     def test_progress_reporter_writes_percentage_and_bytes(self):

@@ -110,7 +110,11 @@ filesystem errors print an `ERROR:` message to stderr and exit non-zero.
 
 `--retries` covers request failures, interrupted blob downloads, and digest or
 size validation failures. On digest or size mismatch, the bad partial file is
-deleted before retrying.
+deleted before retrying. If a download ends early but the `.part` file is still
+smaller than the expected blob size, the partial file is kept and the next
+request resumes with HTTP Range. Short reads that add bytes to the `.part` file
+do not spend the retry budget; `--retries` applies to consecutive failures that
+make no progress.
 
 Use `--verbose` to print a traceback:
 
