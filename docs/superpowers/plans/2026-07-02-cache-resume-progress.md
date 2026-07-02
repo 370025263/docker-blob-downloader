@@ -70,5 +70,5 @@
 - Modify: Git branch metadata.
 
 - [x] Run final verification commands.
-- [ ] Commit the feature.
-- [ ] Push `feature/cache-resume-progress` to GitHub.
+- [x] Commit the feature.
+- [x] Push `feature/cache-resume-progress` to GitHub.
