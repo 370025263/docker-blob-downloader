@@ -24,6 +24,10 @@ Download the default image:
 python3 docker_blob_downloader.py
 ```
 
+By default, verified blobs are cached under `~/.cache/docker-blob-downloader`.
+If the process is interrupted, the next run resumes from any remaining `.part`
+file when the registry supports HTTP Range requests.
+
 Download another image:
 
 ```bash
@@ -41,6 +45,18 @@ Choose an output file:
 
 ```bash
 python3 docker_blob_downloader.py -o vllm-ascend-arm64.tar
+```
+
+Choose a cache directory:
+
+```bash
+python3 docker_blob_downloader.py --cache-dir /data/docker-blob-cache
+```
+
+Disable persistent cache:
+
+```bash
+python3 docker_blob_downloader.py --no-cache
 ```
 
 Load the archive:
@@ -92,10 +108,28 @@ The script does not silently ignore failures. HTTP errors, authentication
 failures, missing platform manifests, digest mismatches, size mismatches, and
 filesystem errors print an `ERROR:` message to stderr and exit non-zero.
 
+`--retries` covers request failures, interrupted blob downloads, and digest or
+size validation failures. On digest or size mismatch, the bad partial file is
+deleted before retrying.
+
 Use `--verbose` to print a traceback:
 
 ```bash
 python3 docker_blob_downloader.py --verbose --dry-run
+```
+
+## Progress
+
+Downloads show a stderr progress line for each config or layer blob:
+
+```text
+blob 2/18 sha256:c36472b34583 42.3% 11.0 MiB/26.1 MiB
+```
+
+Disable progress output:
+
+```bash
+python3 docker_blob_downloader.py --no-progress
 ```
 
 ## Development

@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import io
 import json
+import os
 import re
 import ssl
 import sys
@@ -29,6 +30,7 @@ except ImportError:  # pragma: no cover
 DEFAULT_IMAGE = "quay.io/ascend/vllm-ascend:deepseekv4-a3"
 DEFAULT_ARCH = "aarch64"
 DEFAULT_OS = "linux"
+DEFAULT_CACHE_NAME = "docker-blob-downloader"
 
 OCI_INDEX_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
 DOCKER_MANIFEST_LIST_MEDIA_TYPE = (
@@ -207,9 +209,126 @@ def verify_digest(path, digest, expected_size=None):
         )
 
 
+def default_cache_dir():
+    xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        return Path(xdg_cache_home).expanduser() / DEFAULT_CACHE_NAME
+    return Path.home() / ".cache" / DEFAULT_CACHE_NAME
+
+
 def digest_blob_path(digest):
     algorithm, hex_digest = digest_parts(digest)
     return "blobs/%s/%s" % (algorithm, hex_digest)
+
+
+def cache_blob_path(cache_dir, digest):
+    algorithm, hex_digest = digest_parts(digest)
+    return Path(cache_dir).expanduser() / "blobs" / algorithm / hex_digest
+
+
+def cache_part_path(cache_dir, digest):
+    return Path(str(cache_blob_path(cache_dir, digest)) + ".part")
+
+
+def is_validation_error(exc):
+    text = str(exc)
+    return "digest mismatch" in text or "size mismatch" in text
+
+
+def response_code(response):
+    getcode = getattr(response, "getcode", None)
+    if getcode is None:
+        return None
+    try:
+        return getcode()
+    except Exception:
+        return None
+
+
+def format_bytes(value):
+    if value is None:
+        return "unknown"
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    number = float(value)
+    for unit in units:
+        if number < 1024 or unit == units[-1]:
+            if unit == "B":
+                return "%d B" % int(number)
+            return "%.1f %s" % (number, unit)
+        number /= 1024.0
+    return "%d B" % value
+
+
+def format_progress_bytes(current, total):
+    if total is not None and current < 1024 and total < 1024:
+        return "%d/%d B" % (current, total)
+    if total is not None:
+        return "%s/%s" % (format_bytes(current), format_bytes(total))
+    return format_bytes(current)
+
+
+class ProgressReporter(object):
+    def __init__(self, stream=None, enabled=True):
+        self.stream = stream if stream is not None else sys.stderr
+        self.enabled = enabled
+        self.index = 0
+        self.total = 0
+        self.digest = ""
+        self.expected_size = None
+        self.current = 0
+        self.started_at = None
+
+    def start_blob(self, index, total, digest, expected_size):
+        self.index = index
+        self.total = total
+        self.digest = digest
+        self.expected_size = expected_size
+        self.current = 0
+        self.started_at = time.time()
+        self._write()
+
+    def reset_current(self):
+        self.current = 0
+        self.started_at = time.time()
+        self._write()
+
+    def update(self, size):
+        self.current += size
+        self._write()
+
+    def finish_blob(self):
+        self._write(final=True)
+
+    def _write(self, final=False):
+        if not self.enabled:
+            return
+        digest_short = self.digest
+        if digest_short.startswith("sha256:"):
+            digest_short = "sha256:" + digest_short.split(":", 1)[1][:12]
+        if self.expected_size:
+            percent = min((float(self.current) / float(self.expected_size)) * 100.0, 100.0)
+            size_text = format_progress_bytes(self.current, self.expected_size)
+            message = "blob %s/%s %s %.1f%% %s" % (
+                self.index,
+                self.total,
+                digest_short,
+                percent,
+                size_text,
+            )
+        else:
+            message = "blob %s/%s %s %s" % (
+                self.index,
+                self.total,
+                digest_short,
+                format_bytes(self.current),
+            )
+        if final:
+            self.stream.write("\r%s\n" % message)
+        else:
+            self.stream.write("\r%s" % message)
+        flush = getattr(self.stream, "flush", None)
+        if flush is not None:
+            flush()
 
 
 def _tar_add_bytes(tar, name, data):
@@ -379,52 +498,95 @@ class RegistryClient(object):
         with response:
             return response.read(), response.headers
 
-    def download_blob(self, descriptor, dest_dir):
+    def download_blob(self, descriptor, dest_dir, cache_dir=None, progress=None):
         digest = descriptor.get("digest")
         if not digest:
             raise RegistryError("blob descriptor missing digest: %s" % descriptor)
         expected_size = descriptor.get("size")
         _, hex_digest = digest_parts(digest)
-        dest_path = Path(dest_dir) / hex_digest
+        if cache_dir is not None:
+            dest_path = cache_blob_path(cache_dir, digest)
+            tmp_path = cache_part_path(cache_dir, digest)
+        else:
+            dest_path = Path(dest_dir) / hex_digest
+            tmp_path = Path(str(dest_path) + ".part")
+
         if dest_path.exists():
             verify_digest(dest_path, digest, expected_size)
+            if progress is not None:
+                progress.update(expected_size if expected_size is not None else dest_path.stat().st_size)
             return dest_path
 
-        tmp_path = Path(str(dest_path) + ".part")
-        if tmp_path.exists():
-            tmp_path.unlink()
+        last_error = None
+        for attempt in range(1, self.retries + 1):
+            if attempt > 1 and progress is not None:
+                progress.reset_current()
+            try:
+                return self.download_blob_once(descriptor, dest_path, tmp_path, progress)
+            except RegistryError as exc:
+                last_error = exc
+                if is_validation_error(exc):
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                    if dest_path.exists():
+                        dest_path.unlink()
+                if attempt == self.retries:
+                    raise RegistryError(
+                        "failed to download blob %s after %s attempts: %s"
+                        % (digest, self.retries, exc)
+                    )
+                time.sleep(min(2 ** (attempt - 1), 8))
+
+        raise RegistryError("failed to download blob %s: %s" % (digest, last_error))
+
+    def download_blob_once(self, descriptor, dest_path, tmp_path, progress=None):
+        digest = descriptor.get("digest")
+        expected_size = descriptor.get("size")
+        dest_path = Path(dest_path)
+        tmp_path = Path(tmp_path)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if tmp_path.exists() and expected_size is not None:
+            partial_size = tmp_path.stat().st_size
+            if partial_size == expected_size:
+                verify_digest(tmp_path, digest, expected_size)
+                tmp_path.replace(dest_path)
+                if progress is not None:
+                    progress.update(expected_size)
+                return dest_path
+            if partial_size > expected_size:
+                tmp_path.unlink()
+
+        partial_size = tmp_path.stat().st_size if tmp_path.exists() else 0
+        headers = {}
+        if partial_size > 0:
+            headers["Range"] = "bytes=%s-" % partial_size
         url = self.blob_url(digest)
-        response = self.open_with_auth(url, {})
-        hasher = hashlib.sha256()
-        size = 0
+        response = self.open_with_auth(url, headers)
+        mode = "wb"
+        if partial_size > 0 and response_code(response) == 206:
+            mode = "ab"
+            if progress is not None:
+                progress.update(partial_size)
+        elif partial_size > 0:
+            tmp_path.unlink()
+            partial_size = 0
+
         try:
             with response:
-                with open(str(tmp_path), "wb") as handle:
+                with open(str(tmp_path), mode) as handle:
                     while True:
                         chunk = response.read(self.chunk_size)
                         if not chunk:
                             break
-                        size += len(chunk)
-                        hasher.update(chunk)
                         handle.write(chunk)
+                        if progress is not None:
+                            progress.update(len(chunk))
         except Exception:
-            if tmp_path.exists():
-                tmp_path.unlink()
-            raise
+            raise RegistryError("network error while downloading blob %s" % digest)
 
-        actual_digest = "sha256:" + hasher.hexdigest()
-        if actual_digest != digest:
-            tmp_path.unlink()
-            raise RegistryError(
-                "digest mismatch for downloaded blob %s: expected %s, got %s"
-                % (digest, digest, actual_digest)
-            )
-        if expected_size is not None and size != expected_size:
-            tmp_path.unlink()
-            raise RegistryError(
-                "size mismatch for downloaded blob %s: expected %s bytes, got %s bytes"
-                % (digest, expected_size, size)
-            )
+        verify_digest(tmp_path, digest, expected_size)
         tmp_path.replace(dest_path)
         return dest_path
 
@@ -620,20 +782,44 @@ def download_image(args):
     if not temp_parent.exists():
         raise RegistryError("output directory does not exist: %s" % temp_parent)
 
+    cache_dir = None
+    if not args.no_cache:
+        cache_dir = Path(args.cache_dir).expanduser() if args.cache_dir else default_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        print("using cache: %s" % cache_dir, file=sys.stderr)
+
+    progress = ProgressReporter(stream=sys.stderr, enabled=not args.no_progress)
+
     with tempfile.TemporaryDirectory(prefix="download-", dir=str(temp_parent)) as tmp:
         tmp_path = Path(tmp)
         config_descriptor = manifest["config"]
-        print("downloading config %s" % descriptor_text(config_descriptor), file=sys.stderr)
-        config_path = client.download_blob(config_descriptor, tmp_path)
-        layer_paths = []
         layers = manifest.get("layers") or []
-        for index, layer in enumerate(layers, 1):
-            print(
-                "downloading layer %s/%s %s"
-                % (index, len(layers), descriptor_text(layer)),
-                file=sys.stderr,
+        total_blobs = 1 + len(layers)
+
+        def fetch_blob(index, label, descriptor):
+            if progress.enabled:
+                progress.start_blob(
+                    index,
+                    total_blobs,
+                    descriptor.get("digest", ""),
+                    descriptor.get("size"),
+                )
+            else:
+                print("fetching %s %s" % (label, descriptor_text(descriptor)), file=sys.stderr)
+            path = client.download_blob(
+                descriptor,
+                tmp_path,
+                cache_dir=cache_dir,
+                progress=progress if progress.enabled else None,
             )
-            layer_paths.append(client.download_blob(layer, tmp_path))
+            if progress.enabled:
+                progress.finish_blob()
+            return path
+
+        config_path = fetch_blob(1, "config", config_descriptor)
+        layer_paths = []
+        for index, layer in enumerate(layers, 1):
+            layer_paths.append(fetch_blob(index + 1, "layer %s/%s" % (index, len(layers)), layer))
         annotations = {}
         if not ref.is_digest:
             annotations["org.opencontainers.image.ref.name"] = ref.reference
@@ -664,6 +850,16 @@ def parse_args(argv):
     parser.add_argument("--os", default=DEFAULT_OS, help="target OS, default: %(default)s")
     parser.add_argument("--variant", default=None, help="target platform variant")
     parser.add_argument("-o", "--output", default=None, help="output archive tar path")
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="persistent blob cache directory, default: ~/.cache/docker-blob-downloader",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="disable persistent blob cache and use only a temporary directory",
+    )
     parser.add_argument("--http-proxy", default=None, help="HTTP proxy URL")
     parser.add_argument("--https-proxy", default=None, help="HTTPS proxy URL")
     parser.add_argument(
@@ -680,6 +876,11 @@ def parse_args(argv):
         "--dry-run",
         action="store_true",
         help="resolve the manifest and list blobs without downloading them",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="disable stderr progress output",
     )
     parser.add_argument("--timeout", type=int, default=60, help="HTTP timeout in seconds")
     parser.add_argument("--retries", type=int, default=3, help="HTTP retry count")

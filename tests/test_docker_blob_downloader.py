@@ -1,10 +1,54 @@
 import hashlib
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import docker_blob_downloader as dbd
+
+
+def sha256_digest(data):
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+class FakeResponse:
+    def __init__(self, data, code=200):
+        self._data = data
+        self._offset = 0
+        self._code = code
+        self.headers = {}
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = len(self._data) - self._offset
+        chunk = self._data[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+    def getcode(self):
+        return self._code
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class FakeOpener:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.requests = []
+
+    def open(self, request, timeout=None):
+        self.requests.append(request)
+        if not self._responses:
+            raise AssertionError("no fake responses left")
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class ImageReferenceTests(unittest.TestCase):
@@ -86,6 +130,76 @@ class BlobVerificationTests(unittest.TestCase):
 
             with self.assertRaisesRegex(dbd.RegistryError, "size mismatch"):
                 dbd.verify_digest(path, digest, 3)
+
+
+class CachePathTests(unittest.TestCase):
+    def test_cache_blob_path_is_digest_addressed(self):
+        digest = "sha256:" + ("a" * 64)
+        path = dbd.cache_blob_path(Path("/tmp/cache"), digest)
+
+        self.assertEqual(path, Path("/tmp/cache/blobs/sha256/" + ("a" * 64)))
+
+    def test_cache_part_path_keeps_partial_file_next_to_final_blob(self):
+        digest = "sha256:" + ("b" * 64)
+        path = dbd.cache_part_path(Path("/tmp/cache"), digest)
+
+        self.assertEqual(path, Path("/tmp/cache/blobs/sha256/" + ("b" * 64) + ".part"))
+
+
+class DownloadBlobTests(unittest.TestCase):
+    def test_download_blob_retries_after_digest_mismatch(self):
+        good_data = b"complete blob"
+        digest = sha256_digest(good_data)
+        opener = FakeOpener([FakeResponse(b"bad blob"), FakeResponse(good_data)])
+        client = dbd.RegistryClient("example.test", "repo/image", opener, retries=2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = client.download_blob(
+                {"digest": digest, "size": len(good_data)},
+                Path(tmp) / "work",
+                cache_dir=Path(tmp) / "cache",
+            )
+
+            self.assertEqual(path.read_bytes(), good_data)
+            self.assertEqual(len(opener.requests), 2)
+
+    def test_download_blob_resumes_partial_file_with_range_header(self):
+        full_data = b"partial-then-rest"
+        partial = full_data[:7]
+        rest = full_data[7:]
+        digest = sha256_digest(full_data)
+        opener = FakeOpener([FakeResponse(rest, code=206)])
+        client = dbd.RegistryClient("example.test", "repo/image", opener, retries=1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp) / "cache"
+            part_path = dbd.cache_part_path(cache_dir, digest)
+            part_path.parent.mkdir(parents=True)
+            part_path.write_bytes(partial)
+
+            path = client.download_blob(
+                {"digest": digest, "size": len(full_data)},
+                Path(tmp) / "work",
+                cache_dir=cache_dir,
+            )
+
+            self.assertEqual(path.read_bytes(), full_data)
+            self.assertEqual(opener.requests[0].get_header("Range"), "bytes=7-")
+
+
+class ProgressReporterTests(unittest.TestCase):
+    def test_progress_reporter_writes_percentage_and_bytes(self):
+        stream = io.StringIO()
+        reporter = dbd.ProgressReporter(stream=stream, enabled=True)
+
+        reporter.start_blob(1, 2, "sha256:" + ("c" * 64), 10)
+        reporter.update(5)
+        reporter.finish_blob()
+
+        output = stream.getvalue()
+        self.assertIn("50.0%", output)
+        self.assertIn("5/10 B", output)
+        self.assertIn("1/2", output)
 
 
 class ArchiveTests(unittest.TestCase):

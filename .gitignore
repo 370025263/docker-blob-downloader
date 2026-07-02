@@ -6,3 +6,4 @@ __pycache__/
 *.tar
 *.tar.tmp
 download-*.tmp/
+.docker-blob-cache/
