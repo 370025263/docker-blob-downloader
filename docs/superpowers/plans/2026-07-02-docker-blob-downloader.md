@@ -57,8 +57,8 @@
 **Files:**
 - Modify: repository metadata through Git and GitHub CLI.
 
-- [ ] Initialize Git.
-- [ ] Commit project files with the configured user identity.
-- [ ] Create `370025263/docker-blob-downloader` as a public repository.
-- [ ] Push the default branch.
-- [ ] Verify remote URL and public visibility.
+- [x] Initialize Git.
+- [x] Commit project files with the configured user identity.
+- [x] Create `370025263/docker-blob-downloader` as a public repository.
+- [x] Push the default branch.
+- [x] Verify remote URL and public visibility.
